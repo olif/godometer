@@ -1,104 +1,85 @@
 package main
 
 import (
-	"bufio"
 	"io"
-	"os"
+	"sync"
 	"time"
 )
 
-// ObservableLong is an interface that allows a measurement of type long to be read
-type ObservableLong interface {
-	N() int64
-}
-
-// Sampler samples Observables
-type Sampler struct {
-	stopped   bool
-	endSignal chan bool
-}
-
-// NewSampler returns a new sampler
-func NewSampler() *Sampler {
-	return &Sampler{
-		stopped:   false,
-		endSignal: make(chan bool),
-	}
-}
-
-func (s *Sampler) Stop() {
-	s.endSignal <- true
-}
-
-// Sample starts sampling of the observable
-func (s *Sampler) Sample(periodMs time.Duration, o ObservableLong) <-chan int64 {
-	c := make(chan int64, 100)
-	go func() {
-		for !s.stopped {
-			select {
-			case <-time.After(periodMs * time.Millisecond):
-				c <- o.N()
-			case <-s.endSignal:
-				s.stopped = true
-				close(c)
-			}
-		}
-	}()
-
-	return c
-}
-
+// MonitoredTransfer transfers data between os.File while measuring progress
 type MonitoredTransfer struct {
 	reader    io.Reader
-	writer    *CountingWriter
-	sampler   *Sampler
+	writer    *countingWriter
 	totalSize int64
-	listeners []ValueCallback
+	observers []func(TransferStats)
+	startTime time.Time
 }
 
-func NewMonitoredTransfer(in *os.File, out *os.File) *MonitoredTransfer {
-	var totalSize int64
-	fIn, err := in.Stat()
-	if err != nil {
-		panic(err)
-	}
+// TransferStats represents the current state of the transfer
+type TransferStats struct {
+	transferredBytes int64
+	elapsedTime      time.Duration
+}
 
-	if fIn.Mode().IsRegular() {
-		totalSize = fIn.Size()
-	}
-
-	r := bufio.NewReader(in)
-	w := NewCountingWriter(out)
+// NewMonitoredTransfer Returns a new instance of MonitoredTransfer
+func NewMonitoredTransfer(in io.Reader, out io.Writer, totalSize int64) *MonitoredTransfer {
+	w := &countingWriter{w: out}
 	return &MonitoredTransfer{
-		reader:    r,
+		reader:    in,
 		writer:    w,
 		totalSize: totalSize,
-		listeners: []ValueCallback{},
+		observers: []func(TransferStats){},
 	}
 }
 
-type ValueCallback func(int64)
-
-func (t *MonitoredTransfer) AddListener(cb ValueCallback) {
-	t.listeners = append(t.listeners, cb)
+// AddObserver adds a new observer. Each observer will be called in sync
+func (t *MonitoredTransfer) AddObserver(cb func(TransferStats)) {
+	t.observers = append(t.observers, cb)
 }
 
+// Start starts the transfer
 func (t *MonitoredTransfer) Start() {
-	sampler := NewSampler()
-	valChan := sampler.Sample(100, t.writer)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	go func() {
-		for val := range valChan {
-			t.notify(val)
+		for range ticker.C {
+			t.notify()
 		}
 	}()
+
+	t.startTime = time.Now()
 	io.Copy(t.writer, t.reader)
-	sampler.Stop()
-	val := t.writer.N()
-	t.notify(val)
+	ticker.Stop()
+	t.notify()
 }
 
-func (t *MonitoredTransfer) notify(val int64) {
-	for _, listener := range t.listeners {
-		listener(val)
+func (t *MonitoredTransfer) notify() {
+	stat := TransferStats{
+		transferredBytes: t.writer.n(),
+		elapsedTime:      time.Since(t.startTime),
 	}
+	for _, observer := range t.observers {
+		observer(stat)
+	}
+}
+
+type countingWriter struct {
+	w            io.Writer
+	writtenBytes int64
+	err          error
+	lock         sync.RWMutex
+}
+
+func (w *countingWriter) n() int64 {
+	w.lock.RLock()
+	defer w.lock.RUnlock()
+	return w.writtenBytes
+}
+
+func (w *countingWriter) Write(p []byte) (n int, err error) {
+	n, err = w.w.Write(p)
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	w.writtenBytes += int64(n)
+	w.err = err
+	return
 }

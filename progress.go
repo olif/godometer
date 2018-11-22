@@ -6,48 +6,82 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	pbar "github.com/tj/go-progress"
-	progress "github.com/tj/go-progress"
 	spin "github.com/tj/go-spin"
 	"golang.org/x/sys/unix"
 )
 
 // Progress is tty progress indicator
 type Progress interface {
-	Update(v int64)
+	Update(stats TransferStats)
 	String() string
 }
 
 // FiniteProgress represents a progress indicator with a known ending state
 type FiniteProgress struct {
-	progressBar  *pbar.Bar
-	size         int64
-	currentValue int64
+	progressBar *pbar.Bar
+	size        int64
+	currentStat TransferStats
+}
+
+// Update updates progress with current value
+func (p *FiniteProgress) Update(v TransferStats) {
+	p.currentStat = v
+	p.progressBar.ValueInt(int(v.transferredBytes))
+}
+
+// String returns a tty representation of current progres
+func (p *FiniteProgress) String() string {
+	a := fmt.Sprintf("%s %s", byteCountBinary(p.currentStat.transferredBytes), p.progressBar.String())
+	return CenterLine(a)
 }
 
 // InfiniteProgress represents a progress indicator without a known ending state
 type InfiniteProgress struct {
-	currentValue int64
-	spinner      *spin.Spinner
+	currentStat TransferStats
+	spinner     *spin.Spinner
 }
 
-// NewProgress, returns a finite progress indicator if totalSize > 0 otherwise, an infinite progress indicator
+// Update updates progress with current value
+func (p *InfiniteProgress) Update(v TransferStats) {
+	p.currentStat = v
+}
+
+// String returns a tty representation of current progres
+func (p *InfiniteProgress) String() string {
+	avgSpeed := getAverageSpeed(p.currentStat.transferredBytes, p.currentStat.elapsedTime)
+	speedString := fmt.Sprintf("%s / s", byteCountBinary(int64(avgSpeed)))
+	return fmt.Sprintf("\r  \033[36m\033[m %s transfering: %s, %s", p.spinner.Next(), byteCountBinary(p.currentStat.transferredBytes), speedString)
+}
+
+// NewProgress returns a finite progress indicator if totalSize > 0 otherwise, an infinite progress indicator
 func NewProgress(totalSize int64) Progress {
+	var progress Progress
 	if totalSize > 0 {
-		b := progress.NewInt(int(totalSize))
+		b := pbar.NewInt(int(totalSize))
 		b.Width = getWidth() - 20
-		return &FiniteProgress{
-			progressBar:  b,
-			size:         totalSize,
-			currentValue: 0,
+		progress = &FiniteProgress{
+			progressBar: b,
+			size:        totalSize,
+			currentStat: TransferStats{},
 		}
 	} else {
-		return &InfiniteProgress{
-			spinner:      spin.New(),
-			currentValue: 0,
+		progress = &InfiniteProgress{
+			spinner:     spin.New(),
+			currentStat: TransferStats{},
 		}
 	}
+
+	return progress
+}
+
+func getAverageSpeed(transferredBytes int64, elapsedTime time.Duration) float64 {
+	if elapsedTime == 0 {
+		return 0
+	}
+	return float64(transferredBytes) / (elapsedTime.Seconds())
 }
 
 func byteCountBinary(b int64) string {
@@ -63,24 +97,6 @@ func byteCountBinary(b int64) string {
 	}
 
 	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
-}
-
-func (p *InfiniteProgress) Update(v int64) {
-	p.currentValue = v
-}
-
-func (p *InfiniteProgress) String() string {
-	return fmt.Sprintf("\r  \033[36m\033[m %s transfering: %s ", p.spinner.Next(), byteCountBinary(p.currentValue))
-}
-
-func (p *FiniteProgress) Update(v int64) {
-	p.currentValue = v
-	p.progressBar.ValueInt(int(v))
-}
-
-func (p *FiniteProgress) String() string {
-	a := fmt.Sprintf("%s %s", byteCountBinary(p.currentValue), p.progressBar.String())
-	return CenterLine(a)
 }
 
 func digitsInInt(val int64) int {
