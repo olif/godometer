@@ -51,15 +51,36 @@ func (p *InfiniteProgress) Update(v TransferStats) {
 
 // String returns a tty representation of current progres
 func (p *InfiniteProgress) String() string {
-	avgSpeed := getAverageSpeed(p.currentStat.transferredBytes, p.currentStat.elapsedTime)
-	speedString := fmt.Sprintf("%s / s", byteCountBinary(int64(avgSpeed)))
-	return fmt.Sprintf("\r  \033[36m\033[m %s transfering: %s, %s", p.spinner.Next(), byteCountBinary(p.currentStat.transferredBytes), speedString)
+	return fmt.Sprintf("\r  \033[36m\033[m %s transfering: %s, %s, %s",
+		p.spinner.Next(),
+		byteCountBinary(p.currentStat.transferredBytes),
+		fmtDuration(p.currentStat.elapsedTime),
+		fmtAvgSpeed(p.currentStat))
+}
+
+func fmtAvgSpeed(tf TransferStats) string {
+	var speed float64
+	if tf.elapsedTime > 0 {
+		speed = float64(tf.transferredBytes) / tf.elapsedTime.Seconds()
+	}
+
+	return fmt.Sprintf("%s/s", byteCountBinary(int64(speed)))
+}
+
+func fmtDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	s := d / time.Second
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 }
 
 // NewProgress returns a finite progress indicator if totalSize > 0 otherwise, an infinite progress indicator
 func NewProgress(totalSize int64) Progress {
 	var progress Progress
-	if totalSize > 0 {
+	if totalSize < 0 {
 		b := pbar.NewInt(int(totalSize))
 		b.Width = getWidth() - 20
 		progress = &FiniteProgress{
