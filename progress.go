@@ -1,15 +1,22 @@
 package main
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
+	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	pbar "github.com/tj/go-progress"
 	spin "github.com/tj/go-spin"
+	"github.com/tredoe/term"
 	"golang.org/x/sys/unix"
 )
 
@@ -24,6 +31,7 @@ type FiniteProgress struct {
 	progressBar *pbar.Bar
 	size        int64
 	currentStat TransferStats
+	cursorPos   int
 }
 
 // Update updates progress with current value
@@ -42,6 +50,7 @@ func (p *FiniteProgress) String() string {
 type InfiniteProgress struct {
 	currentStat TransferStats
 	spinner     *spin.Spinner
+	cursorPos   int
 }
 
 // Update updates progress with current value
@@ -51,7 +60,8 @@ func (p *InfiniteProgress) Update(v TransferStats) {
 
 // String returns a tty representation of current progres
 func (p *InfiniteProgress) String() string {
-	return fmt.Sprintf("\r  \033[36m\033[m %s transfering: %s, %s, %s",
+	MoveTo(0, p.cursorPos)
+	return fmt.Sprintf("\033[36m\033[m %s transfering: %s, %s, %s",
 		p.spinner.Next(),
 		byteCountBinary(p.currentStat.transferredBytes),
 		fmtDuration(p.currentStat.elapsedTime),
@@ -79,6 +89,7 @@ func fmtDuration(d time.Duration) string {
 
 // NewProgress returns a finite progress indicator if totalSize > 0 otherwise, an infinite progress indicator
 func NewProgress(totalSize int64) Progress {
+
 	var progress Progress
 	if totalSize < 0 {
 		b := pbar.NewInt(int(totalSize))
@@ -89,13 +100,56 @@ func NewProgress(totalSize int64) Progress {
 			currentStat: TransferStats{},
 		}
 	} else {
+		HideCursor()
+		lock()
+		_, line, _ := GetCursorPosition()
+		fmt.Fprintf(os.Stderr, "\n")
+		debug("Got position")
+
 		progress = &InfiniteProgress{
 			spinner:     spin.New(),
 			currentStat: TransferStats{},
+			cursorPos:   line,
 		}
+		releaseLock()
+		debug("released lock")
 	}
 
 	return progress
+}
+
+func lock() {
+	flockT := syscall.Flock_t{
+		Type:   syscall.F_WRLCK,
+		Whence: io.SeekStart,
+		Start:  0,
+		Len:    1,
+	}
+	for syscall.FcntlFlock(os.Stderr.Fd(), syscall.F_SETLK, &flockT) != nil {
+		time.Sleep(50)
+		debug("Could not acquire lock sleeping")
+	}
+
+	debug("Got lock")
+}
+
+func releaseLock() {
+	flockT := syscall.Flock_t{
+		Type:   syscall.F_UNLCK,
+		Whence: io.SeekStart,
+		Start:  0,
+		Len:    1,
+	}
+
+	err := syscall.FcntlFlock(os.Stderr.Fd(), syscall.F_SETLK, &flockT)
+	if err != nil {
+		debug("Could not release lock")
+	}
+}
+
+// MoveTo moves the cursor to (x, y).
+func MoveTo(x, y int) {
+	fmt.Fprintf(os.Stderr, "\033[%d;%df", y, x)
 }
 
 func getAverageSpeed(transferredBytes int64, elapsedTime time.Duration) float64 {
@@ -132,12 +186,28 @@ func CenterLine(s string) string {
 	xpad := int(math.Abs(float64((int(w) - Length(s)) / 2)))
 	ypad := 1 // int(h / 2)
 	MoveUp(3)
+	RestoreCursorPosition()
 	return r("\n", ypad) + r(" ", xpad) + s + r("\n", ypad)
 
 }
 
+// SaveCursorPosition saves the cursor position.
+func SaveCursorPosition() {
+	fmt.Fprintf(os.Stderr, "\033[s")
+}
+
+// RestoreCursorPosition saves the cursor position.
+func RestoreCursorPosition() {
+	fmt.Fprintf(os.Stderr, "\033[u")
+}
+
 func MoveUp(n int) {
 	fmt.Fprintf(os.Stderr, "\033[%dF", n)
+}
+
+// MoveDown moves the cursor to the beginning of n lines down.
+func MoveDown(n int) {
+	fmt.Fprintf(os.Stderr, "\033[%dE", n)
 }
 
 func getWinsize() (*unix.Winsize, error) {
@@ -179,4 +249,69 @@ func Length(s string) (n int) {
 		n++
 	}
 	return
+}
+
+func GetCursorPosition() (col int, line int, err error) {
+	// set terminal to raw mode and back
+	t, err := term.New()
+	if err != nil {
+		fallback_SetRawMode()
+		defer fallback_SetCookedMode()
+	} else {
+		t.RawMode()
+		defer t.Restore()
+	}
+
+	// same as $ echo -e "\033[6n"
+	// by printing the output, we are triggering input
+	fmt.Fprintf(os.Stderr, fmt.Sprintf("\r%c[6n", 27))
+
+	// capture keyboard output from print command
+	reader := bufio.NewReader(os.Stderr)
+
+	// capture the triggered stdin from the print
+	text, _ := reader.ReadSlice('R')
+
+	// check for the desired output
+	re := regexp.MustCompile(`\d+;\d+`)
+	res := re.FindString(string(text))
+
+	// make sure that cooked mode gets set
+	if res != "" {
+		parts := strings.Split(res, ";")
+		line, _ = strconv.Atoi(parts[0])
+		col, _ = strconv.Atoi(parts[1])
+		return col, line, nil
+
+	} else {
+		return 0, 0, errors.New("unable to read cursor position")
+	}
+}
+
+func fallback_SetRawMode() {
+	rawMode := exec.Command("/bin/stty", "raw")
+	rawMode.Stdin = os.Stderr
+	_ = rawMode.Run()
+	rawMode.Wait()
+}
+
+func fallback_SetCookedMode() {
+	// I've noticed that this does not always work when called from
+	// inside the program. From command line, you can run the following
+	// '$ go run calling_app.go; stty -raw'
+	// if you lose the ability to visably enter new text
+	cookedMode := exec.Command("/bin/stty", "-raw")
+	cookedMode.Stdin = os.Stderr
+	_ = cookedMode.Run()
+	cookedMode.Wait()
+}
+
+// HideCursor hides the cursor.
+func HideCursor() {
+	fmt.Fprintf(os.Stderr, "\033[?25l")
+}
+
+// ShowCursor shows the cursor.
+func ShowCursor() {
+	fmt.Fprintf(os.Stderr, "\033[?25h")
 }

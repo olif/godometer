@@ -18,9 +18,8 @@ func main() {
 	}
 
 	reader := bufio.NewReader(os.Stdin)
-	writer := bufio.NewWriter(os.Stdout)
 
-	t := NewMonitoredTransfer(reader, writer, totalSize)
+	t := NewMonitoredTransfer(reader, os.Stdout, totalSize)
 	p := NewProgress(t.totalSize)
 
 	updateTTY := func(stats TransferStats) {
