@@ -19,3 +19,7 @@ or
 <p align="center">
   <img src="../assets/screenshot.png?raw=true" alt="Screenshot"/>
 </p>
+
+# TODO
+  + Implement support for multiprocess output
+
